@@ -1,150 +1,135 @@
 import streamlit as st
 import cv2
-import math
+import tempfile
 import numpy as np
 from ultralytics import YOLO
+from PIL import Image
 
 # ==========================================
-# 0. FUNGSI BANTUAN (PENGGANTI CVZONE)
+# 1. KONFIGURASI HALAMAN & MODEL
 # ==========================================
-# Kita pakai ini agar tidak perlu install cvzone yg bikin error di Cloud
-def draw_text_rect(img, text, pos, scale=3, thickness=3, colorT=(255, 255, 255),
-                   colorR=(255, 0, 255), font=cv2.FONT_HERSHEY_PLAIN,
-                   offset=10, border=None, border_color=(255, 255, 255)):
-    ox, oy = pos
-    (w, h), _ = cv2.getTextSize(text, font, scale, thickness)
-    x1, y1, x2, y2 = ox - offset, oy + offset, ox + w + offset, oy - h - offset
+st.set_page_config(page_title="Tes Deteksi Parkir (Simple)", layout="wide")
 
-    cv2.rectangle(img, (x1, y1), (x2, y2), colorR, cv2.FILLED)
-    if border is not None:
-        cv2.rectangle(img, (x1, y1), (x2, y2), border_color, border)
-    cv2.putText(img, text, (ox, oy), font, scale, colorT, thickness)
-    return img
-
-# ==========================================
-# 1. KONFIGURASI & LOAD MODEL
-# ==========================================
-st.set_page_config(page_title="Smart Parking YOLO", layout="wide")
-
-# Cache model agar tidak diload berulang-ulang (Bikin Cepat)
 @st.cache_resource
 def load_model():
+    # Pastikan file best.pt ada satu folder dengan app.py
     return YOLO('best.pt')
 
-# Load Model
 try:
     model = load_model()
 except Exception as e:
-    st.error(f"Error loading model: {e}")
+    st.error(f"Gagal memuat model 'best.pt'. Error: {e}")
     st.stop()
 
-# Class Names
-classNames = ['car', 'empty'] 
-
-# Database Koordinat (Sesuai punya Anda)
-PARKING_ROIS = {
-    # --- KOLOM 1 ---
-    "A-01": [45, 103, 100, 32],
-    "A-02": [45, 153, 100, 32],
-    "A-03": [45, 203, 100, 32],
-    "A-04": [45, 253, 100, 32],
-    "A-05": [45, 303, 100, 32],
-    "A-06": [45, 353, 100, 32],
-    
-    # --- KOLOM 3 (Contoh) ---
-    "C-01": [398, 103, 100, 32],
-    "C-02": [398, 153, 100, 32],
-    "C-03": [398, 203, 100, 32],
-    "C-04": [398, 253, 100, 32],
-}
+# Ambil nama kelas langsung dari model (biar tidak salah urutan)
+# Biasanya: {0: 'car', 1: 'free'} atau sebaliknya
+class_names = model.names
+st.sidebar.success(f"Model berhasil dimuat! Kelas: {class_names}")
 
 # ==========================================
-# 2. TAMPILAN STREAMLIT
+# 2. UPLOAD FILE
 # ==========================================
-st.title("🚗 Smart Parking Detection System")
-st.caption("Menggunakan YOLOv11 & OpenCV")
+st.title("🚗 Tes Murni Deteksi YOLO (Tanpa Mapping)")
+st.write("Upload video/gambar untuk melihat apakah model bisa membedakan **Mobil** vs **Kosong**.")
 
-col1, col2 = st.columns([3, 1])
-
-with col2:
-    st.write("### Kontrol")
-    run = st.checkbox('Mulai Deteksi', value=False)
-    st.info("Centang kotak di atas untuk memulai video.")
-    
-    # Placeholder untuk statistik (Opsional)
-    status_text = st.empty()
-
-# Placeholder untuk Video
-with col1:
-    stframe = st.empty()
+uploaded_file = st.sidebar.file_uploader("Upload File Disini", type=['mp4', 'avi', 'mov', 'jpg', 'jpeg', 'png'])
 
 # ==========================================
-# 3. LOOPING PROGRAM
+# 3. FUNGSI GAMBAR HASIL
 # ==========================================
-if run:
-    cap = cv2.VideoCapture('carPark.mp4')
+def process_frame(frame, conf_threshold, iou_threshold):
+    # Run YOLO
+    # imgsz=1280 agar deteksi lebih tajam untuk objek kecil/jauh
+    results = model(frame, imgsz=1280, conf=conf_threshold, iou=iou_threshold, verbose=False)
     
-    if not cap.isOpened():
-        st.error("File 'carPark.mp4' tidak ditemukan. Pastikan sudah diupload ke GitHub.")
-    
-    while run:
-        success, frame = cap.read()
-        if not success:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            continue
+    # Hitung Statistik
+    count_car = 0
+    count_free = 0
 
-        # Proses Deteksi YOLO
-        results = model(frame, stream=True, verbose=False)
-        car_points = []
-
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0]
-                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                conf = math.ceil((box.conf[0] * 100)) / 100
-                cls = int(box.cls[0])
-                currentClass = classNames[cls]
-
-                if currentClass == 'car' and conf > 0.4:
-                    cx = int((x1 + x2) / 2)
-                    cy = int((y1 + y2) / 2)
-                    car_points.append((cx, cy))
-
-        # Logika Pencocokan
-        counter_empty = 0
-        for slot_name, (x, y, w, h) in PARKING_ROIS.items():
-            is_occupied = False
-            color = (0, 255, 0) # Hijau (BGR untuk OpenCV)
+    for r in results:
+        boxes = r.boxes
+        for box in boxes:
+            # Ambil koordinat & kelas
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cls = int(box.cls[0])
+            label_name = class_names[cls].lower() # car / free
             
-            for (cx, cy) in car_points:
-                if x < cx < x + w and y < cy < y + h:
-                    is_occupied = True
-                    break 
-        
-            if is_occupied:
+            # Tentukan Warna & Label
+            # Mobil = Merah, Free = Hijau
+            if 'car' in label_name:
                 color = (0, 0, 255) # Merah
+                count_car += 1
+                label = f"Car {box.conf[0]:.2f}"
+            elif 'free' in label_name or 'empty' in label_name:
+                color = (0, 255, 0) # Hijau
+                count_free += 1
+                label = f"Free {box.conf[0]:.2f}"
             else:
-                counter_empty += 1
+                color = (255, 0, 0) # Biru (Lainnya)
+                label = f"{label_name}"
 
-            # Gambar Kotak
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            # Gambar Kotak & Label
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             
-            # Pakai Fungsi Custom (Pengganti cvzone)
-            draw_text_rect(frame, slot_name, (x, y - 5), scale=0.7, thickness=1, 
-                           offset=0, colorR=color)
+            # Background tulisan biar terbaca
+            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+            cv2.rectangle(frame, (x1, y1 - 20), (x1 + w, y1), color, -1)
+            cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-        # Tampilkan Info Total di Layar Video
-        draw_text_rect(frame, f'Available: {counter_empty}/{len(PARKING_ROIS)}', 
-                       (50, 50), scale=2, thickness=2, offset=10, colorR=(0,200,0))
+    # Tampilkan Total di Pojok Kiri Atas
+    info_text = f"Mobil: {count_car} | Kosong: {count_free}"
+    cv2.rectangle(frame, (5, 5), (350, 50), (0, 0, 0), -1) # Background hitam
+    cv2.putText(frame, info_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    
+    return frame, count_car, count_free
+
+# ==========================================
+# 4. LOGIKA UTAMA
+# ==========================================
+if uploaded_file is not None:
+    # Slider untuk mengatur sensitivitas (Biar user bisa main-main settingan)
+    conf = st.sidebar.slider("Confidence (Keyakinan)", 0.0, 1.0, 0.25)
+    iou = st.sidebar.slider("IoU (Tumpang Tindih)", 0.0, 1.0, 0.45)
+
+    file_type = uploaded_file.name.split('.')[-1].lower()
+
+    # --- MODE VIDEO ---
+    if file_type in ['mp4', 'avi', 'mov']:
+        tfile = tempfile.NamedTemporaryFile(delete=False) 
+        tfile.write(uploaded_file.read())
+        cap = cv2.VideoCapture(tfile.name)
         
-        # Update Statistik di Sidebar juga
-        status_text.markdown(f"# Tersedia: {counter_empty}")
-
-        # KONVERSI WARNA (PENTING: OpenCV pakai BGR, Streamlit pakai RGB)
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        st_frame = st.empty()
+        st_metrics = st.empty()
         
-        # Tampilkan ke Placeholder Streamlit
-        stframe.image(frame_rgb, channels="RGB")
+        stop_btn = st.button("Stop Video")
+        
+        while cap.isOpened() and not stop_btn:
+            success, frame = cap.read()
+            if not success:
+                break
+            
+            # Proses
+            processed_frame, c_car, c_free = process_frame(frame, conf, iou)
+            
+            # Update Gambar
+            processed_frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+            st_frame.image(processed_frame_rgb, channels="RGB", use_column_width=True)
+            
+            # Update Angka Realtime
+            st_metrics.markdown(f"### 📊 Status: **{c_car}** Mobil, **{c_free}** Kosong")
+            
+        cap.release()
 
-    cap.release()
+    # --- MODE GAMBAR ---
+    elif file_type in ['jpg', 'jpeg', 'png']:
+        image = Image.open(uploaded_file)
+        frame = np.array(image)
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) # Convert ke BGR
+        
+        # Proses
+        processed_frame, c_car, c_free = process_frame(frame, conf, iou)
+        
+        # Tampilkan
+        st.image(cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB), caption="Hasil Deteksi", use_column_width=True)
+        st.info(f"Terdeteksi: {c_car} Mobil dan {c_free} Slot Kosong.")
